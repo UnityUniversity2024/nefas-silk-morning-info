@@ -1,0 +1,42 @@
+name: CEO Morning Intelligence Updater
+
+on:
+  schedule:
+    # 04:00 UTC is exactly 7:00 AM in Addis Ababa (EAT)
+    - cron: '0 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape-and-publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install Dependencies
+        run: |
+          npm install puppeteer puppeteer-extra puppeteer-extra-plugin-stealth nodemailer
+
+      - name: Run CEO Analytics Pipeline
+        env:
+          EMAIL_USER: ${{ secrets.EMAIL_USER }}
+          EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+          BOSS_EMAIL: ${{ secrets.BOSS_EMAIL }}
+        run: node daily_mailer.js
+
+      - name: Commit and Push Updated HTML
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "Auto-update CEO HTML dashboard" || exit 0
+          git push

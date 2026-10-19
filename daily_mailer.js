@@ -14,10 +14,7 @@ async function fetchArabicaPrice() {
         const data = await response.json();
         const price = data.chart.result[0].meta.regularMarketPrice;
         return price ? '$' + (parseFloat(price) / 100).toFixed(2) : 'N/A';
-    } catch (e) { 
-        console.log('Yahoo Finance timeout bypassed.');
-        return 'N/A'; 
-    }
+    } catch (e) { return 'N/A'; }
 }
 
 async function fetchForexRates() {
@@ -32,11 +29,10 @@ async function fetchForexRates() {
             return r && r.transactionalSelling ? r.transactionalSelling.toFixed(2) : 'N/A';
         };
 
-        if (rates.length === 0) throw new Error("CBE API empty");
+        if (rates.length === 0) throw new Error("CBE fallback");
 
         return { USD: getRate('USD'), EUR: getRate('EUR'), GBP: getRate('GBP'), CNY: getRate('CNY'), AED: getRate('AED') };
     } catch (e) {
-        console.log("CBE API blocked GitHub. Switching to global fallback...");
         try {
             const response = await fetch('https://open.er-api.com/v6/latest/USD', { timeout: 10000 });
             const data = await response.json();
@@ -67,38 +63,75 @@ async function scrapeInvestingCom(browser, url, name) {
         await page.close();
         return price;
     } catch (e) {
-        console.log(`Scraper timeout bypassed for ${name}`);
         if (page) await page.close().catch(() => {});
         return 'N/A';
+    }
+}
+
+// Scrapes the full ECX table from https://ecx.eem.et/
+async function scrapeFullECX(browser) {
+    let page;
+    try {
+        page = await browser.newPage();
+        await page.goto('https://ecx.eem.et/', { waitUntil: 'networkidle2', timeout: 20000 });
+        await new Promise(r => setTimeout(r, 3000));
+
+        const rows = await page.evaluate(() => {
+            const tableRows = Array.from(document.querySelectorAll('table tbody tr'));
+            if (tableRows.length === 0) return null;
+
+            return tableRows.map(row => {
+                const cols = Array.from(row.querySelectorAll('td')).map(td => td.innerText.trim());
+                return {
+                    nameSymbol: cols[0] || '',
+                    grade: cols[1] || '',
+                    type: cols[2] || '',
+                    warehouse: cols[3] || '',
+                    closePrice: cols[4] || '',
+                    change: cols[6] || cols[5] || '',
+                    volume: cols[7] || cols[6] || ''
+                };
+            });
+        });
+
+        await page.close();
+        return rows;
+    } catch (e) {
+        console.log('ECX scraper bypassed: ' + e.message);
+        if (page) await page.close().catch(() => {});
+        return null;
     }
 }
 
 async function runAutomation() {
     let browser;
     try {
-        console.log('1. Fetching APIs...');
+        console.log('1. Pulling market feeds & CBE Forex...');
         const [arabicaLivePrice, forexRates] = await Promise.all([
             fetchArabicaPrice(),
             fetchForexRates()
         ]);
 
-        console.log('2. Launching browser...');
         browser = await puppeteer.launch({ 
             headless: 'new', 
             args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'] 
         });
 
-        const robustaRaw = await scrapeInvestingCom(browser, 'https://www.investing.com/commodities/london-coffee', 'Robusta');
-        const brentRaw = await scrapeInvestingCom(browser, 'https://www.investing.com/commodities/brent-oil', 'Brent');
-        const soyRaw = await scrapeInvestingCom(browser, 'https://www.investing.com/commodities/us-soybeans', 'Soy');
-        const rubberRaw = await scrapeInvestingCom(browser, 'https://www.investing.com/commodities/rubber-rss3-futures', 'Rubber');
+        console.log('2. Scraping commodities & full ECX data...');
+        const [robustaRaw, brentRaw, soyRaw, rubberRaw, ecxData] = await Promise.all([
+            scrapeInvestingCom(browser, 'https://www.investing.com/commodities/london-coffee', 'Robusta'),
+            scrapeInvestingCom(browser, 'https://www.investing.com/commodities/brent-oil', 'Brent'),
+            scrapeInvestingCom(browser, 'https://www.investing.com/commodities/us-soybeans', 'Soy'),
+            scrapeInvestingCom(browser, 'https://www.investing.com/commodities/rubber-rss3-futures', 'Rubber'),
+            scrapeFullECX(browser)
+        ]);
 
         const robustaLivePrice = robustaRaw && robustaRaw !== 'N/A' ? '$' + robustaRaw.replace(/,/g, '') : 'N/A';
         const brentLivePrice = brentRaw && brentRaw !== 'N/A' ? '$' + brentRaw : 'N/A';
         const soyLivePrice = soyRaw && soyRaw !== 'N/A' ? '$' + soyRaw : 'N/A';
         const rubberLivePrice = rubberRaw && rubberRaw !== 'N/A' ? '$' + rubberRaw : 'N/A';
 
-        console.log('3. Updating HTML...');
+        console.log('3. Injecting into CEO Dashboard...');
         const page = await browser.newPage();
         const filePath = 'file://' + path.join(__dirname, FILE_NAME);
         
@@ -106,11 +139,10 @@ async function runAutomation() {
         catch (e) { console.log('Bypassed HTML load timeout'); }
 
         const dateStr = new Date().toLocaleString('en-US', { timeZone: 'Africa/Addis_Ababa' });
-        
         const brentNum = brentRaw !== 'N/A' ? parseFloat(brentRaw) : 0;
         const rubberNum = rubberRaw !== 'N/A' ? parseFloat(rubberRaw) : 0;
-        
-        await page.evaluate((arabica, robusta, brent, soy, rubber, brentNum, rubberNum, fx, dateStr) => {
+
+        await page.evaluate((arabica, robusta, brent, soy, rubber, brentNum, rubberNum, fx, dateStr, ecx) => {
             if (arabica !== 'N/A' && document.getElementById('arabica-price')) document.getElementById('arabica-price').innerText = arabica;
             if (robusta !== 'N/A' && document.getElementById('robusta-price')) document.getElementById('robusta-price').innerText = robusta;
             if (brent !== 'N/A' && document.getElementById('brent-price')) document.getElementById('brent-price').innerText = brent;
@@ -124,11 +156,35 @@ async function runAutomation() {
             if (fx.AED !== 'N/A' && document.getElementById('fx-aed')) document.getElementById('fx-aed').innerText = fx.AED;
             
             if (document.getElementById('report-date')) document.getElementById('report-date').innerText = "Last Updated: " + dateStr;
-            
             if (document.getElementById('brent-num-data')) document.getElementById('brent-num-data').innerText = brentNum;
             if (document.getElementById('rubber-num-data')) document.getElementById('rubber-num-data').innerText = rubberNum;
             if (document.getElementById('usd-num-data')) document.getElementById('usd-num-data').innerText = fx.USD;
-        }, arabicaLivePrice, robustaLivePrice, brentLivePrice, soyLivePrice, rubberLivePrice, brentNum, rubberNum, forexRates, dateStr);
+
+            // Injects dynamic rows if scraped from ECX portal
+            if (ecx && ecx.length > 0 && document.getElementById('ecx-table-body')) {
+                const tbody = document.getElementById('ecx-table-body');
+                tbody.innerHTML = '';
+                ecx.forEach(item => {
+                    const isPositive = (item.change || '').includes('+');
+                    const badgeClass = isPositive 
+                        ? 'color: #10b981; background: #ecfdf5; padding: 2px 8px; border-radius: 12px; font-weight: bold; font-size: 12px;'
+                        : 'color: #e11d48; background: #fff1f2; padding: 2px 8px; border-radius: 12px; font-weight: bold; font-size: 12px;';
+
+                    const tr = document.createElement('tr');
+                    tr.className = 'hover:bg-slate-50 transition-colors';
+                    tr.innerHTML = `
+                        <td class="px-6 py-4 font-black text-slate-900">${item.nameSymbol}</td>
+                        <td class="px-6 py-4 font-medium text-slate-600">${item.grade}</td>
+                        <td class="px-6 py-4 font-medium text-slate-600">${item.type}</td>
+                        <td class="px-6 py-4 font-medium text-slate-600">${item.warehouse}</td>
+                        <td class="px-6 py-4 font-black text-slate-900">${item.closePrice}</td>
+                        <td class="px-6 py-4"><span style="${badgeClass}">${item.change}</span></td>
+                        <td class="px-6 py-4 font-medium text-slate-600">${item.volume}</td>
+                    `;
+                    tbody.appendChild(tr);
+                });
+            }
+        }, arabicaLivePrice, robustaLivePrice, brentLivePrice, soyLivePrice, rubberLivePrice, brentNum, rubberNum, forexRates, dateStr, ecxData);
 
         const updatedHTML = await page.content();
         fs.writeFileSync(path.join(__dirname, FILE_NAME), updatedHTML);
@@ -140,38 +196,22 @@ async function runAutomation() {
             auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASS }
         });
 
-        const emailHTML = `
-            <div style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e2e8f0; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
-                <div style="background: #0f172a; padding: 25px; text-align: center;">
-                    <h2 style="margin: 0; color: #ffffff; font-size: 22px; font-weight: 900; text-transform: uppercase;">CEO Strategic Brief</h2>
-                    <p style="margin: 5px 0 0; color: #94a3b8; font-size: 12px; font-weight: bold; letter-spacing: 1px;">${dateStr}</p>
-                </div>
-                <div style="padding: 30px;">
-                    <p style="margin: 0 0 20px; color: #334155; font-size: 14px; text-align: center;">Your interactive <strong>Analytics Dashboard</strong> is attached. Double-click the file to open it securely in any browser.</p>
-                    
-                    <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; margin-bottom: 20px;">
-                        <h4 style="margin: 0 0 10px; font-size: 12px; text-transform: uppercase; color: #0f172a; border-bottom: 1px solid #cbd5e1; padding-bottom: 5px;">🌍 Official Forex Rates</h4>
-                        <div style="display: flex; justify-content: space-between; font-size: 14px; font-weight: bold;">
-                            <span style="color: #64748b;">USD: <span style="color: #0f172a;">${forexRates.USD}</span></span>
-                            <span style="color: #64748b;">EUR: <span style="color: #0f172a;">${forexRates.EUR}</span></span>
-                            <span style="color: #64748b;">CNY: <span style="color: #0f172a;">${forexRates.CNY}</span></span>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        `;
-
         await transporter.sendMail({
             from: process.env.EMAIL_USER,
             to: process.env.BOSS_EMAIL,
-            subject: `CEO Interactive Dashboard - ${dateStr}`,
-            html: emailHTML,
+            subject: `CEO Strategic Dashboard & Complete ECX Summary - ${dateStr}`,
+            html: `<div style="font-family:sans-serif;padding:20px;color:#0f172a;">
+                <h2>CEO Strategic Intelligence Report</h2>
+                <p>Date: <strong>${dateStr}</strong></p>
+                <p>The daily interactive dashboard containing global commodities, verified CBE exchange rates, and the <strong>full ECX Daily Trade Summary</strong> is attached.</p>
+                <p><em>Double-click the attached HTML file to open in your browser.</em></p>
+            </div>`,
             attachments: [{ filename: `CEO_Analytics_Dashboard.html`, path: path.join(__dirname, FILE_NAME) }]
         });
         
-        console.log('Script completely finished. Success!');
+        console.log('Automation complete. Sent to ' + process.env.BOSS_EMAIL);
     } catch (error) {
-        console.error('Non-Fatal Error Encountered:', error.message);
+        console.error('Pipeline Error:', error);
     }
 }
 runAutomation();
